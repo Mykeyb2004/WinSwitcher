@@ -36,15 +36,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusBarIcon(item: NSStatusItem?) {
         guard let button = item?.button else { return }
         let controller = SwitcherController.shared
-        let symbolName: String
+        let image: NSImage?
         if controller.isCircuitBreakerTripped {
-            symbolName = "exclamationmark.triangle"
+            image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: "WinSwitcher")
         } else if controller.isPaused {
-            symbolName = "pause.rectangle"
+            image = NSImage(systemSymbolName: "pause.rectangle", accessibilityDescription: "WinSwitcher")
         } else {
-            symbolName = "macwindow.on.rectangle"
+            let customIcon = Bundle.main.image(forResource: NSImage.Name("MenuBarIcon"))
+            customIcon?.accessibilityDescription = "WinSwitcher"
+            image = customIcon
+                ?? NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "WinSwitcher")
         }
-        let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: "WinSwitcher")
         image?.isTemplate = true
         button.image = image
     }

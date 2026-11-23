@@ -33,6 +33,9 @@ mkdir -p "${APP_BUNDLE}/Contents/Resources"
 
 cp "${BIN_PATH}" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
 cp "${ROOT_DIR}/Resources/Info.plist" "${APP_BUNDLE}/Contents/Info.plist"
+cp "${ROOT_DIR}/Resources/AppIcon.icns" "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
+cp "${ROOT_DIR}/Resources/MenuBarIcon.png" "${APP_BUNDLE}/Contents/Resources/MenuBarIcon.png"
+cp "${ROOT_DIR}/Resources/MenuBarIcon@2x.png" "${APP_BUNDLE}/Contents/Resources/MenuBarIcon@2x.png"
 printf "APPL????" > "${APP_BUNDLE}/Contents/PkgInfo"
 
 echo "==> Ad-hoc code signing ${APP_BUNDLE}..."
