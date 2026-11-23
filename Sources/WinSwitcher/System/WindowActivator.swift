@@ -12,10 +12,13 @@ private struct UncheckedAXBox: @unchecked Sendable {
 }
 
 /// Activates or closes a specific macOS window with Windows-style single-window focus,
-/// guaranteed unminimize/unhide restoration, and cross-Space transition.
+/// single-window unminimize restoration, and cross-Space transition.
 ///
-/// All cross-process AX/SkyLight IPC runs on a dedicated background queue so a slow or hung
-/// target app can NEVER stall the Main Thread or EventTap.
+/// Strict single-window guarantee (`singleWindowRaise == true`):
+/// - NEVER calls `NSRunningApplication.activate()`, `kAXFrontmostAttribute`, or `NSWorkspace.openApplication`,
+///   all of which cause macOS to bring every open/minimized window of the application to the front.
+/// - Exclusively uses SkyLight `_SLPSSetFrontProcessWithOptions(psn, windowID, 0x200)` + `SLPSPostEventRecordTo`
+///   scoped to the exact `CGWindowID`, paired with per-window `kAXMinimizedAttribute = false` and `kAXRaiseAction`.
 @MainActor
 enum WindowActivator {
     private static let activatorQueue = DispatchQueue(
@@ -34,9 +37,8 @@ enum WindowActivator {
     ) {
         let app = NSRunningApplication(processIdentifier: window.pid)
         let wasHidden = (app?.isHidden ?? false) || window.isHidden
-        let bundleURL = app?.bundleURL
 
-        // 1. Unhide owning application first if it was hidden via Cmd+H.
+        // Only call unhide() if the application was explicitly hidden via Cmd+H.
         if let app, wasHidden {
             app.unhide()
         }
@@ -47,13 +49,12 @@ enum WindowActivator {
         let cachedMinimized = window.isMinimized
 
         activatorQueue.async {
-            // If the app was hidden, give macOS a brief window to finish unhiding its windows before focusing.
             if wasHidden {
-                waitUntilUnhidden(pid: pid, maxWaitMs: 180)
+                waitUntilUnhidden(pid: pid, maxWaitMs: 160)
             }
 
-            // 2. Always obtain a LIVE AXUIElement (resolving on demand if nil or stale, including off-Space windows).
-            let resolvedAX = resolveLiveAXWindow(
+            // 1. Resolve the target window's live AXUIElement.
+            var resolvedAX = resolveLiveAXWindow(
                 cached: boxedAX.element,
                 pid: pid,
                 windowID: windowID
@@ -62,7 +63,7 @@ enum WindowActivator {
                 onResolvedAX?(SendableAXElement(element: resolvedAX))
             }
 
-            // 3. Check the LIVE kAXMinimizedAttribute (never rely solely on cached descriptor.isMinimized!).
+            // 2. Check live minimized state on this specific AXUIElement.
             var actuallyMinimized = cachedMinimized
             if let ax = resolvedAX {
                 AXUIElementSetMessagingTimeout(ax, restoreTimeoutSeconds)
@@ -71,32 +72,59 @@ enum WindowActivator {
                 }
             }
 
-            // 4. Restore (unminimize) if minimized.
-            var didUnminimize = false
-            if actuallyMinimized {
-                if let ax = resolvedAX {
-                    didUnminimize = unminimizeWindow(ax: ax, pid: pid)
+            if singleWindowRaise {
+                // 3a. Make target process frontmost scoped strictly to `windowID` via SkyLight.
+                // Doing this first also ensures inactive Electron/Chromium processes accept kAXMinimizedAttribute = false
+                // without ever activating sibling windows.
+                _ = SkyLightBridge.shared.focusSingleWindow(pid: pid, windowID: windowID)
+
+                // If the window was on another Space and AX wasn't resolved yet, try resolving again after Space focus request.
+                if resolvedAX == nil {
+                    Thread.sleep(forTimeInterval: 0.05)
+                    resolvedAX = resolveLiveAXWindow(cached: nil, pid: pid, windowID: windowID)
+                    if let resolvedAX {
+                        onResolvedAX?(SendableAXElement(element: resolvedAX))
+                        if let liveMin = readBoolAttribute(resolvedAX, kAXMinimizedAttribute) {
+                            actuallyMinimized = liveMin
+                        }
+                    }
                 }
 
-                // Fallback for non-standard apps where AXUIElement was unavailable or rejected kAXMinimizedAttribute:
-                // sending an open/reopen event matches clicking the Dock icon and unminimizes the window.
-                if !didUnminimize, let bundleURL {
-                    reopenApplicationFallback(bundleURL: bundleURL)
-                    Thread.sleep(forTimeInterval: 0.12)
-                } else if didUnminimize {
-                    // Brief pause so WindowServer finishes mapping the window out of the Dock before raising/focusing.
-                    Thread.sleep(forTimeInterval: 0.05)
+                // 3b. If this specific window is minimized, unminimize ONLY this AXUIElement.
+                if actuallyMinimized, let ax = resolvedAX {
+                    unminimizeSingleWindow(ax: ax, pid: pid, windowID: windowID)
+                }
+
+                // 3c. Raise ONLY this specific window and lock key-window focus onto `windowID`.
+                if let ax = resolvedAX {
+                    AXUIElementSetMessagingTimeout(ax, restoreTimeoutSeconds)
+                    AXUIElementPerformAction(ax, kAXRaiseAction as CFString)
+                }
+                _ = SkyLightBridge.shared.focusSingleWindow(pid: pid, windowID: windowID)
+
+                if actuallyMinimized || wasHidden {
+                    Thread.sleep(forTimeInterval: 0.08)
+                    if let ax = resolvedAX {
+                        AXUIElementPerformAction(ax, kAXRaiseAction as CFString)
+                    }
+                    _ = SkyLightBridge.shared.focusSingleWindow(pid: pid, windowID: windowID)
+                }
+            } else {
+                // Non-single-window mode (macOS standard whole-app activation)
+                if actuallyMinimized, let ax = resolvedAX {
+                    AXUIElementSetMessagingTimeout(ax, restoreTimeoutSeconds)
+                    AXUIElementSetAttributeValue(ax, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+                    _ = pollUntilUnminimized(ax: ax, maxWaitMs: 250)
+                }
+                DispatchQueue.main.async {
+                    NSRunningApplication(processIdentifier: pid)?.activate()
+                }
+                if let ax = resolvedAX {
+                    AXUIElementSetMessagingTimeout(ax, restoreTimeoutSeconds)
+                    AXUIElementSetAttributeValue(ax, kAXMainAttribute as CFString, kCFBooleanTrue)
+                    AXUIElementPerformAction(ax, kAXRaiseAction as CFString)
                 }
             }
-
-            // 5. Focus and raise the target window.
-            performFocusAndRaise(
-                pid: pid,
-                windowID: windowID,
-                ax: resolvedAX,
-                singleWindowRaise: singleWindowRaise,
-                wasRestoredFromMinimizedOrHidden: actuallyMinimized || wasHidden
-            )
 
             if let onDidFinish {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
@@ -139,7 +167,6 @@ enum WindowActivator {
         pid: pid_t,
         windowID: WindowID
     ) -> AXUIElement? {
-        // Verify cached AX element is still alive and maps to the exact same CGWindowID.
         if let cached {
             AXUIElementSetMessagingTimeout(cached, probeTimeoutSeconds)
             if let liveWID = SkyLightBridge.shared.windowID(for: cached), liveWID == windowID {
@@ -150,7 +177,6 @@ enum WindowActivator {
             }
         }
 
-        // Fast live lookup via kAXWindowsAttribute (covers all current-Space & Dock-minimized windows).
         let appAX = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(appAX, probeTimeoutSeconds)
         var windowsRef: CFTypeRef?
@@ -163,34 +189,33 @@ enum WindowActivator {
             }
         }
 
-        // Off-Space fallback: discover via macOS remote AX token (covers windows minimized on other Spaces).
         let remote = SkyLightBridge.shared.discoverRemoteAXWindows(
             forPID: pid,
             targetWindowIDs: [windowID],
-            maxElementID: 1000,
+            maxElementID: 1200,
             timeBudgetSeconds: 0.25
         )
         return remote[windowID] ?? cached
     }
 
-    private nonisolated static func unminimizeWindow(ax: AXUIElement, pid: pid_t) -> Bool {
+    /// Unminimizes ONLY the target `AXUIElement` without activating or restoring any sibling windows.
+    private nonisolated static func unminimizeSingleWindow(
+        ax: AXUIElement,
+        pid: pid_t,
+        windowID: WindowID
+    ) {
         AXUIElementSetMessagingTimeout(ax, restoreTimeoutSeconds)
+        AXUIElementSetAttributeValue(ax, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
 
-        let firstErr = AXUIElementSetAttributeValue(ax, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-        if pollUntilUnminimized(ax: ax, maxWaitMs: 180) {
-            return true
+        if pollUntilUnminimized(ax: ax, maxWaitMs: 160) {
+            return
         }
 
-        // Some macOS / Chromium / Electron apps ignore kAXMinimizedAttribute = false while their process is inactive.
-        // Activate the process and retry setting kAXMinimizedAttribute = false.
-        activateAppOnMain(pid: pid)
-        Thread.sleep(forTimeInterval: 0.04)
-        let secondErr = AXUIElementSetAttributeValue(ax, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-        if pollUntilUnminimized(ax: ax, maxWaitMs: 250) {
-            return true
-        }
-
-        return firstErr == .success || secondErr == .success
+        // Retry with single-window SkyLight front-process focus (never whole-app activate!)
+        _ = SkyLightBridge.shared.focusSingleWindow(pid: pid, windowID: windowID)
+        Thread.sleep(forTimeInterval: 0.03)
+        AXUIElementSetAttributeValue(ax, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+        _ = pollUntilUnminimized(ax: ax, maxWaitMs: 260)
     }
 
     private nonisolated static func pollUntilUnminimized(ax: AXUIElement, maxWaitMs: Int) -> Bool {
@@ -204,52 +229,6 @@ enum WindowActivator {
             elapsed += stepMs
         }
         return (readBoolAttribute(ax, kAXMinimizedAttribute) == false)
-    }
-
-    private nonisolated static func performFocusAndRaise(
-        pid: pid_t,
-        windowID: WindowID,
-        ax: AXUIElement?,
-        singleWindowRaise: Bool,
-        wasRestoredFromMinimizedOrHidden: Bool
-    ) {
-        if singleWindowRaise {
-            let skyLightOK = SkyLightBridge.shared.focusSingleWindow(pid: pid, windowID: windowID)
-            raiseAXWindow(ax)
-
-            if wasRestoredFromMinimizedOrHidden {
-                // Re-assert focus after the Dock deminiaturize / unhide transition so the restored window
-                // never finishes behind the previously active window.
-                Thread.sleep(forTimeInterval: 0.07)
-                let retryOK = SkyLightBridge.shared.focusSingleWindow(pid: pid, windowID: windowID)
-                raiseAXWindow(ax)
-
-                if !skyLightOK && !retryOK {
-                    activateAppOnMain(pid: pid)
-                    raiseAXWindow(ax)
-                } else if !isAppActive(pid: pid) {
-                    activateAppOnMain(pid: pid)
-                    raiseAXWindow(ax)
-                }
-            } else if !skyLightOK {
-                activateAppOnMain(pid: pid)
-                raiseAXWindow(ax)
-            }
-        } else {
-            activateAppOnMain(pid: pid)
-            raiseAXWindow(ax)
-            if wasRestoredFromMinimizedOrHidden {
-                Thread.sleep(forTimeInterval: 0.07)
-                raiseAXWindow(ax)
-            }
-        }
-    }
-
-    private nonisolated static func raiseAXWindow(_ ax: AXUIElement?) {
-        guard let ax else { return }
-        AXUIElementSetMessagingTimeout(ax, restoreTimeoutSeconds)
-        AXUIElementSetAttributeValue(ax, kAXMainAttribute as CFString, kCFBooleanTrue)
-        AXUIElementPerformAction(ax, kAXRaiseAction as CFString)
     }
 
     private nonisolated static func readBoolAttribute(_ ax: AXUIElement, _ attr: String) -> Bool? {
@@ -267,32 +246,6 @@ enum WindowActivator {
             }
             Thread.sleep(forTimeInterval: Double(stepMs) / 1000.0)
             elapsed += stepMs
-        }
-    }
-
-    private nonisolated static func isAppActive(pid: pid_t) -> Bool {
-        NSRunningApplication(processIdentifier: pid)?.isActive == true
-    }
-
-    private nonisolated static func activateAppOnMain(pid: pid_t) {
-        let appAX = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(appAX, restoreTimeoutSeconds)
-        AXUIElementSetAttributeValue(appAX, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
-
-        DispatchQueue.main.async {
-            if let app = NSRunningApplication(processIdentifier: pid) {
-                app.unhide()
-                app.activate()
-            }
-        }
-    }
-
-    private nonisolated static func reopenApplicationFallback(bundleURL: URL) {
-        DispatchQueue.main.async {
-            let config = NSWorkspace.OpenConfiguration()
-            config.activates = true
-            config.createsNewApplicationInstance = false
-            NSWorkspace.shared.openApplication(at: bundleURL, configuration: config)
         }
     }
 }
