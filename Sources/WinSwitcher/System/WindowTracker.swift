@@ -47,6 +47,7 @@ final class WindowTracker: ObservableObject {
     private var workspaceObservers: [NSObjectProtocol] = []
     private var lastFocusedWindowID: WindowID?
     private var periodicSyncTimer: Timer?
+    private var appSwitchRefreshWorkItem: DispatchWorkItem?
     private var remoteDiscoveryInFlight: Set<pid_t> = []
     private var isScanInFlight: Bool = false
     private var pendingScanNeedsRemoteAX: Bool = false
@@ -70,7 +71,7 @@ final class WindowTracker: ObservableObject {
         periodicSyncTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, !self.mruEngine.isSessionActive else { return }
-                self.refreshAll(includeRemoteAXDiscovery: false)
+                self.refreshAll(includeRemoteAXDiscovery: true)
             }
         }
     }
@@ -78,6 +79,8 @@ final class WindowTracker: ObservableObject {
     func stop() {
         periodicSyncTimer?.invalidate()
         periodicSyncTimer = nil
+        appSwitchRefreshWorkItem?.cancel()
+        appSwitchRefreshWorkItem = nil
         for obs in workspaceObservers {
             NSWorkspace.shared.notificationCenter.removeObserver(obs)
         }
@@ -112,6 +115,10 @@ final class WindowTracker: ObservableObject {
 
     func axElement(for windowID: WindowID) -> AXUIElement? {
         axElementCache[windowID]
+    }
+
+    func cacheAXElement(_ element: AXUIElement, for windowID: WindowID) {
+        axElementCache[windowID] = element
     }
 
     func appIcon(for pid: pid_t) -> NSImage? {
@@ -698,6 +705,18 @@ final class WindowTracker: ObservableObject {
                 }
             }
         }
+
+        // Fast debounced background scan (~250ms) so apps that don't emit kAXWindowMiniaturizedNotification
+        // (such as Chrome/Electron) still have their minimized state detected and sunk promptly.
+        appSwitchRefreshWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                guard let self, !self.mruEngine.isSessionActive else { return }
+                self.refreshAll(includeRemoteAXDiscovery: false)
+            }
+        }
+        appSwitchRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: workItem)
     }
 
     private func handleAppHidden(_ app: NSRunningApplication?) {
@@ -812,6 +831,7 @@ final class WindowTracker: ObservableObject {
 
         case kAXWindowMiniaturizedNotification:
             if let wid = SkyLightBridge.shared.windowID(for: element) {
+                axElementCache[wid] = element
                 if let existing = windowsByID[wid] {
                     windowsByID[wid] = WindowDescriptor(
                         id: existing.id,
@@ -832,6 +852,7 @@ final class WindowTracker: ObservableObject {
 
         case kAXWindowDeminiaturizedNotification:
             if let wid = SkyLightBridge.shared.windowID(for: element) {
+                axElementCache[wid] = element
                 if let existing = windowsByID[wid] {
                     windowsByID[wid] = WindowDescriptor(
                         id: existing.id,

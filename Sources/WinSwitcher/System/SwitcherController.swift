@@ -349,10 +349,22 @@ final class SwitcherController: ObservableObject {
 
         guard let target = tracker.commitSwitcherSession() else { return }
         let axElement = tracker.axElement(for: target.id)
+        let targetID = target.id
         WindowActivator.activate(
             window: target,
             axElement: axElement,
-            singleWindowRaise: AppSettings.shared.singleWindowRaise
+            singleWindowRaise: AppSettings.shared.singleWindowRaise,
+            onResolvedAX: { [weak self] boxed in
+                Task { @MainActor in
+                    self?.tracker.cacheAXElement(boxed.element, for: targetID)
+                }
+            },
+            onDidFinish: { [weak self] in
+                Task { @MainActor in
+                    guard let self, !self.tracker.mruEngine.isSessionActive else { return }
+                    self.tracker.refreshAll(includeRemoteAXDiscovery: false)
+                }
+            }
         )
     }
 
